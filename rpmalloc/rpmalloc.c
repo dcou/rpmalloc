@@ -766,11 +766,16 @@ _memory_heap_cache_insert(heap_t* heap, span_t* span) {
 #if ENABLE_UNLIMITED_THREAD_CACHE
 	_memory_span_list_push(&heap->span_cache[idx], span);
 #else
+#if THREAD_CACHE_MULTIPLIER
 	const size_t release_count = (!idx ? _memory_span_release_count : _memory_span_release_count_large);
 	if (_memory_span_list_push(&heap->span_cache[idx], span) <= (release_count * THREAD_CACHE_MULTIPLIER))
 		return;
 	heap->span_cache[idx] = _memory_span_list_split(span, release_count);
 	assert(span->data.list.size == release_count);
+#else
+	span->data.list.size = 1;
+#endif
+
 #if ENABLE_STATISTICS
 	heap->thread_to_global += (size_t)span->data.list.size * span_count * _memory_span_size;
 #endif
