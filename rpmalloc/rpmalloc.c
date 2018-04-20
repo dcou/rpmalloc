@@ -67,7 +67,7 @@
 //! Multiplier for thread cache (cache limit will be span release count multiplied by this value)
 #define THREAD_CACHE_MULTIPLIER 16
 //! Multiplier for global cache (cache limit will be span release count multiplied by this value)
-#define GLOBAL_CACHE_MULTIPLIER 64
+#define GLOBAL_CACHE_MULTIPLIER 32
 //! The limit of deferred dealloc size before forcing dealloc directly from the freeing thread
 #define MAX_DEFERRED_DEALLOC_SIZE (1024*1024)
 
@@ -194,7 +194,7 @@ static FORCEINLINE void _release_lock(atomic32_t * lock) { while (!atomic_cas_va
 //! Total number of small + medium size classes
 #define SIZE_CLASS_COUNT          (SMALL_CLASS_COUNT + MEDIUM_CLASS_COUNT)
 //! Number of large block size classes
-#define LARGE_CLASS_COUNT         32
+#define LARGE_CLASS_COUNT         128
 //! Maximum size of a medium block
 #define MEDIUM_SIZE_LIMIT         (SMALL_SIZE_LIMIT + (MEDIUM_GRANULARITY * MEDIUM_CLASS_COUNT))
 //! Maximum size of a large block
@@ -233,6 +233,8 @@ typedef struct span_list_t span_list_t;
 typedef union span_data_t span_data_t;
 //! Global cache
 typedef struct global_cache_t global_cache_t;
+//! Thread cache
+typedef struct thread_cache_t thread_cache_t;
 
 //! Flag indicating span is the first (master) span of a split superspan
 #define SPAN_FLAG_MASTER 1
@@ -296,6 +298,13 @@ struct span_t {
 };
 _Static_assert(sizeof(span_t) <= SPAN_HEADER_SIZE, "span size mismatch");
 
+struct thread_cache_t {
+	//! Cache list pointer
+	span_t * span;
+	//! __rdtsc of the last usage of this global cache bucket
+	atomic64_t last_access;
+};
+
 struct heap_t {
 	//! Heap ID
 	int32_t      id;
@@ -307,7 +316,7 @@ struct heap_t {
 	span_t*      size_cache[SIZE_CLASS_COUNT];
 #if ENABLE_THREAD_CACHE
 	//! List of free spans (single linked list)
-	span_t*      span_cache[LARGE_CLASS_COUNT];
+	thread_cache_t span_cache[LARGE_CLASS_COUNT];
 #endif
 	//! Mapped but unused spans
 	span_t*      span_reserve;
@@ -354,6 +363,8 @@ struct global_cache_t {
 	atomic32_t size;
 	//! ABA counter
 	atomic32_t counter;
+	//! __rdtsc of the last usage of this global cache bucket
+	atomic64_t last_access;
 };
 
 /// Global data
@@ -810,14 +821,15 @@ _memory_heap_cache_insert(heap_t* heap, span_t* span) {
 #if ENABLE_THREAD_CACHE
 	size_t span_count = span->span_count;
 	size_t idx = span_count - 1;
+	heap->span_cache[idx].last_access = __rdtsc();
 #if ENABLE_UNLIMITED_THREAD_CACHE
-	_memory_span_list_push(&heap->span_cache[idx], span);
+	_memory_span_list_push(&heap->span_cache[idx].span, span);
 #else
 #if THREAD_CACHE_MULTIPLIER
 	const size_t release_count = (!idx ? _memory_span_release_count : _memory_span_release_count_large);
-	if (_memory_span_list_push(&heap->span_cache[idx], span) <= (release_count * THREAD_CACHE_MULTIPLIER))
+	if (_memory_span_list_push(&heap->span_cache[idx].span, span) <= (release_count * THREAD_CACHE_MULTIPLIER))
 		return;
-	heap->span_cache[idx] = _memory_span_list_split(span, release_count);
+	heap->span_cache[idx].span = _memory_span_list_split(span, release_count);
 	assert(span->data.list.size == release_count);
 #else
 	span->data.list.size = 1;
@@ -842,9 +854,10 @@ static span_t*
 _memory_heap_cache_extract(heap_t* heap, size_t span_count) {
 #if ENABLE_THREAD_CACHE
 	size_t idx = span_count - 1;
+	heap->span_cache[idx].last_access = __rdtsc();
 	//Step 1: check thread cache
-	if (heap->span_cache[idx])
-		return _memory_span_list_pop(&heap->span_cache[idx]);
+	if (heap->span_cache[idx].span)
+		return _memory_span_list_pop(&heap->span_cache[idx].span);
 #endif
 	//Step 2: Check reserved spans
 	if (heap->spans_reserved >= span_count)
@@ -853,8 +866,8 @@ _memory_heap_cache_extract(heap_t* heap, size_t span_count) {
 	//Step 3: Check larger super spans and split if we find one
 	span_t* span = 0;
 	for (++idx; idx < LARGE_CLASS_COUNT; ++idx) {
-		if (heap->span_cache[idx]) {
-			span = _memory_span_list_pop(&heap->span_cache[idx]);
+		if (heap->span_cache[idx].span) {
+			span = _memory_span_list_pop(&heap->span_cache[idx].span);
 			break;
 		}
 	}
@@ -882,12 +895,12 @@ _memory_heap_cache_extract(heap_t* heap, size_t span_count) {
 #if ENABLE_GLOBAL_CACHE
 	//Step 4: Extract from global cache
 	idx = span_count - 1;
-	heap->span_cache[idx] = _memory_global_cache_extract(span_count);
-	if (heap->span_cache[idx]) {
+	heap->span_cache[idx].span = _memory_global_cache_extract(span_count);
+	if (heap->span_cache[idx].span) {
 #if ENABLE_STATISTICS
 		heap->global_to_thread += (size_t)heap->span_cache[idx]->data.list.size * span_count * _memory_span_size;
 #endif
-		return _memory_span_list_pop(&heap->span_cache[idx]);
+		return _memory_span_list_pop(&heap->span_cache[idx].span);
 	}
 #endif
 #endif
@@ -1413,6 +1426,7 @@ _memory_adjust_size_class(size_t iclass) {
 static span_t*
 _memory_cache_extract(global_cache_t* cache) {
 	uintptr_t span_ptr;
+	cache->last_access = __rdtsc();
 	do {
 		void* global_span = atomic_load_ptr(&cache->cache);
 		span_ptr = (uintptr_t)global_span & _memory_span_mask;
@@ -1439,6 +1453,54 @@ _memory_cache_extract(global_cache_t* cache) {
 	} while (span_ptr);
 	return 0;
 }
+
+HANDLE hQuit = NULL;
+HANDLE hThread = NULL;
+
+DWORD WINAPI _autotrim_thread_proc(LPVOID data)
+{
+	uint64_t last = __rdtsc();
+	while (WaitForSingleObject(hQuit, 1000) == WAIT_TIMEOUT)
+	{
+		uint64_t now = __rdtsc();
+		rpmalloc_trim_cache(now - ((now - last) * _memory_config.auto_trim_seconds));
+		last = now;
+	}
+	return 0;
+}
+
+static void
+_autotrim_start()
+{
+	if (hQuit)
+		return;
+
+	hQuit = CreateEventA(NULL, TRUE, FALSE, NULL);
+	DWORD threadId;
+	hThread =
+		CreateThread(
+		NULL,
+		0,
+		_autotrim_thread_proc,
+		0,
+		0,
+		&threadId);
+}
+
+static void
+_autotrim_stop()
+{
+	if (hQuit)
+	{
+		SetEvent(hQuit);
+		WaitForSingleObject(hThread, INFINITE);
+		CloseHandle(hThread);
+		CloseHandle(hQuit);
+		hQuit = NULL;
+		hThread = NULL;
+	}
+}
+
 
 //! Initialize the allocator and setup global data
 int
@@ -1601,6 +1663,10 @@ rpmalloc_initialize_config(const rpmalloc_config_t* config) {
 
 	//Initialize this thread
 	rpmalloc_thread_initialize();
+
+	if (_memory_config.auto_trim_seconds)
+		_autotrim_start();
+
 	return 0;
 }
 
@@ -1608,6 +1674,8 @@ rpmalloc_initialize_config(const rpmalloc_config_t* config) {
 void
 rpmalloc_finalize(void) {
 	atomic_thread_fence_acquire();
+
+	_autotrim_stop();
 
 	rpmalloc_thread_finalize();
 	//If you hit this assert, you still have active threads or forgot to finalize some thread(s)
@@ -1627,8 +1695,8 @@ rpmalloc_finalize(void) {
 			//Free span caches (other thread might have deferred after the thread using this heap finalized)
 #if ENABLE_THREAD_CACHE
 			for (size_t iclass = 0; iclass < LARGE_CLASS_COUNT; ++iclass) {
-				if (heap->span_cache[iclass])
-					_memory_unmap_span_list(heap->span_cache[iclass]);
+				if (heap->span_cache[iclass].span)
+					_memory_unmap_span_list(heap->span_cache[iclass].span);
 			}
 #endif
 			heap_t* next_heap = heap->next_heap;
@@ -1685,7 +1753,7 @@ rpmalloc_thread_finalize(void) {
 	//Release thread cache spans back to global cache
 #if ENABLE_THREAD_CACHE
 	for (size_t iclass = 0; iclass < LARGE_CLASS_COUNT; ++iclass) {
-		span_t* span = heap->span_cache[iclass];
+		span_t* span = heap->span_cache[iclass].span;
 #if ENABLE_GLOBAL_CACHE
 		while (span) {
 			assert(span->span_count == (iclass + 1));
@@ -1698,7 +1766,7 @@ rpmalloc_thread_finalize(void) {
 		if (span)
 			_memory_unmap_span_list(span);
 #endif
-		heap->span_cache[iclass] = 0;
+		heap->span_cache[iclass].span = 0;
 	}
 #endif
 	_release_heap_lock(heap);
@@ -1966,8 +2034,8 @@ rpmalloc_thread_statistics(rpmalloc_thread_statistics_t* stats) {
 
 #if ENABLE_THREAD_CACHE
 	for (size_t iclass = 0; iclass < LARGE_CLASS_COUNT; ++iclass) {
-		if (heap->span_cache[iclass])
-			stats->spancache = (size_t)heap->span_cache[iclass]->data.list.size * (iclass + 1) * _memory_span_size;
+		if (heap->span_cache[iclass].span)
+			stats->spancache = (size_t)heap->span_cache[iclass].span->data.list.size * (iclass + 1) * _memory_span_size;
 	}
 #endif
 	_release_heap_lock(heap);
@@ -1987,3 +2055,143 @@ rpmalloc_global_statistics(rpmalloc_global_statistics_t* stats) {
 	}
 #endif
 }
+
+void
+_trim_heap_cache(heap_t * heap, uint64_t since)
+{
+	_acquire_heap_lock(heap);
+	//_memory_deallocate_deferred(heap);
+
+	//Release thread cache spans back to global cache
+#if ENABLE_THREAD_CACHE
+	for (size_t iclass = 0; iclass < LARGE_CLASS_COUNT; ++iclass) {
+		span_t* span = heap->span_cache[iclass].span;
+		if (span && ((uint64_t)heap->span_cache[iclass].last_access < since))
+		{
+#if ENABLE_GLOBAL_CACHE
+			while (span) {
+				assert(span->span_count == (iclass + 1));
+				size_t release_count = (!iclass ? _memory_span_release_count : _memory_span_release_count_large);
+				span_t* next = _memory_span_list_split(span, (uint32_t)release_count);
+				_memory_global_cache_insert(span);
+				span = next;
+			}
+#else
+			if (span)
+				_memory_unmap_span_list(span);
+#endif
+			heap->span_cache[iclass].span = 0;
+		}
+	}
+#endif
+	_release_heap_lock(heap);
+}
+
+void
+rpmalloc_trim_cache(uint64_t since) {
+	atomic_thread_fence_acquire();
+
+	//we can't trim heap cache from other thread unless the spinlock on the heap is active
+#if ENABLE_GREEDY_DEALLOC
+	for (size_t list_idx = 0; list_idx < HEAP_ARRAY_SIZE; ++list_idx) {
+		heap_t* heap = atomic_load_ptr(&_memory_heaps[list_idx]);
+		while (heap) {
+			_trim_heap_cache(heap, since);
+			heap = heap->next_heap;
+		}
+	}
+#endif
+
+#if ENABLE_GLOBAL_CACHE
+	for (size_t iclass = 0; iclass < LARGE_CLASS_COUNT; ++iclass)
+	{
+		global_cache_t * gc = &_memory_span_cache[iclass];
+		if (!gc->size)
+			continue;
+
+		if ((uint64_t)gc->last_access < since)
+		{
+
+			span_t * span;
+			while ((span = _memory_cache_extract(gc)) != (void*)0)
+				_memory_unmap_span_list(span);
+		}
+	}
+#endif
+}
+
+#pragma optimize ("", off)
+#include <stdio.h>
+void
+rpmalloc_print_debug_info_heap(heap_t * heap) {
+    _acquire_heap_lock(heap);
+    void* p = atomic_load_ptr(&heap->defer_deallocate);
+    uint64_t deferred = 0;
+    while (p) {
+        void* next = *(void**)p;
+        span_t* span = (void*)((uintptr_t)p & _memory_span_mask);
+        deferred += _memory_size_class[span->size_class].size;
+        printf("deferred allocation of size %d (size class %d)\n", _memory_size_class[span->size_class].size, span->size_class);
+        p = next;
+    }
+    if (deferred)
+        printf("total deferred = %llu\n", deferred);
+
+    uint64_t active = 0;
+    for (size_t isize = 0; isize < SIZE_CLASS_COUNT; ++isize) {
+        if (heap->active_block[isize].free_count)
+        {
+            active += heap->active_block[isize].free_count * _memory_size_class[heap->active_span[isize]->size_class].size;
+            printf("active of size %d (size class %d)\n", heap->active_block[isize].free_count * _memory_size_class[heap->active_span[isize]->size_class].size, isize);
+        }
+
+        uint64_t sizecache = 0;
+        span_t* cache = heap->size_cache[isize];
+        while (cache) {
+            printf("active of size %d (size class %d)\n", cache->data.block.free_count * _memory_size_class[cache->size_class].size, cache->size_class);
+            sizecache += cache->data.block.free_count * _memory_size_class[cache->size_class].size;
+            cache = cache->next_span;
+        }
+        if (sizecache)
+            printf("total size cached = %llu (size class %d)\n", sizecache, isize);
+    }
+    if (active)
+        printf("total active %llu\n", active);
+
+#if ENABLE_THREAD_CACHE
+    for (size_t iclass = 0; iclass < LARGE_CLASS_COUNT; ++iclass) {
+        if (heap->span_cache[iclass].span)
+            printf("active of size %d (size class %d)\n", (size_t)heap->span_cache[iclass].span->data.list.size * (iclass + 1) * _memory_span_size, iclass);
+    }
+#endif
+    _release_heap_lock(heap);
+}
+
+//! Finalize the allocator
+void
+rpmalloc_print_debug_info(void) {
+    atomic_thread_fence_acquire();
+
+    for (size_t list_idx = 0; list_idx < HEAP_ARRAY_SIZE; ++list_idx) {
+        heap_t* heap = atomic_load_ptr(&_memory_heaps[list_idx]);
+        while (heap) {
+            rpmalloc_print_debug_info_heap(heap);
+            heap = heap->next_heap;
+        }
+    }
+
+#if ENABLE_GLOBAL_CACHE
+    //Free global caches
+    uint64_t globalCache = 0;
+    for (size_t iclass = 0; iclass < LARGE_CLASS_COUNT; ++iclass)
+    {
+        size_t s = (size_t)atomic_load32(&_memory_span_cache[iclass].size) * (iclass + 1) * _memory_span_size;
+        printf("global cache of size %d (size class %d) (last_use: %llu vs %llu)\n", s, _memory_size_class[iclass].size, _memory_span_cache[iclass].last_access, __rdtsc());
+        globalCache += s;
+    }
+
+    printf("global cache size %llu\n", globalCache);
+#endif
+}
+
+#pragma optimize ("", on)
