@@ -1459,7 +1459,7 @@ _memory_cache_extract(global_cache_t* cache) {
 HANDLE hQuit = NULL;
 HANDLE hThread = NULL;
 
-DWORD WINAPI _autotrim_thread_proc(LPVOID data)
+DWORD WINAPI rpmalloc_autotrim_thread_proc(LPVOID data)
 {
 	while (WaitForSingleObject(hQuit, 1000) == WAIT_TIMEOUT)
 		rpmalloc_trim_cache(_memory_config.auto_trim_seconds);
@@ -1478,7 +1478,7 @@ _autotrim_start()
 		CreateThread(
 		NULL,
 		0,
-		_autotrim_thread_proc,
+		rpmalloc_autotrim_thread_proc,
 		0,
 		0,
 		&threadId);
@@ -2064,7 +2064,10 @@ _trim_heap_cache(heap_t * heap, int64_t since)
 #if ENABLE_THREAD_CACHE
 	for (size_t iclass = 0; iclass < LARGE_CLASS_COUNT; ++iclass) {
 		span_t* span = heap->span_cache[iclass].span;
-		if (span && (heap->span_cache[iclass].last_access < since))
+		if (!span)
+			continue;
+
+		if (heap->span_cache[iclass].last_access < since)
 		{
 			/*printf("trimming thread cache of size %ld (size class %lu) (last_use: %lld vs %lld)\n",
 				(size_t)heap->span_cache[iclass].span->data.list.size * (iclass + 1) * _memory_span_size, 
