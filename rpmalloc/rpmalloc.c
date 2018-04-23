@@ -44,6 +44,10 @@
 //! Allow deallocating memory from freeing thread when the owner thread of the heap is inactive. (small performance hit).
 #define ENABLE_GREEDY_DEALLOC     1
 #endif
+#ifndef ENABLE_EXPLICIT_COMMIT
+//! Enable explicit commit for debugging purpose allowing us to see the callstack when each reserved page is actually used
+#define ENABLE_EXPLICIT_COMMIT    0
+#endif
 #ifndef DISABLE_UNMAP
 //! Disable unmapping memory pages
 #define DISABLE_UNMAP             0
@@ -900,7 +904,7 @@ _memory_heap_cache_extract(heap_t* heap, size_t span_count) {
 	heap->span_cache[idx].span = _memory_global_cache_extract(span_count);
 	if (heap->span_cache[idx].span) {
 #if ENABLE_STATISTICS
-		heap->global_to_thread += (size_t)heap->span_cache[idx]->data.list.size * span_count * _memory_span_size;
+		heap->global_to_thread += (size_t)heap->span_cache[idx].span->data.list.size * span_count * _memory_span_size;
 #endif
 		return _memory_span_list_pop(&heap->span_cache[idx].span);
 	}
@@ -1506,6 +1510,33 @@ rpmalloc_initialize(void) {
 	return rpmalloc_initialize_config(0);
 }
 
+#if ENABLE_EXPLICIT_COMMIT
+// Exception handler for dealing with committing memory.
+static LONG CALLBACK
+explicit_commit_handler(PEXCEPTION_POINTERS exception_pointers) {
+    // Only handle access violations.
+    if (exception_pointers->ExceptionRecord->ExceptionCode !=
+        EXCEPTION_ACCESS_VIOLATION) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    // Determine the address of the page that is being accessed.
+    uintptr_t addr =
+        (uintptr_t)(exception_pointers->ExceptionRecord->ExceptionInformation[1]);
+    
+    uintptr_t page = addr & ~(_memory_page_size - 1);
+
+    // Commit the page.
+    uintptr_t result =
+        (uintptr_t)VirtualAlloc((LPVOID)page, _memory_page_size, MEM_COMMIT, PAGE_READWRITE);
+    if (result != page) 
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    // The page mapping succeeded, so continue execution as usual.
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+#endif
+
 int
 rpmalloc_initialize_config(const rpmalloc_config_t* config) {
 	if (config)
@@ -1515,6 +1546,10 @@ rpmalloc_initialize_config(const rpmalloc_config_t* config) {
 		_memory_config.memory_map = _memory_map_os;
 		_memory_config.memory_unmap = _memory_unmap_os;
 	}
+
+#if ENABLE_EXPLICIT_COMMIT
+	AddVectoredExceptionHandler(TRUE, &explicit_commit_handler);
+#endif
 
 	_memory_huge_pages = 0;
 	_memory_page_size = _memory_config.page_size;
@@ -1801,8 +1836,12 @@ _memory_map_os(size_t size, size_t* offset) {
 	size_t padding = ((size >= _memory_span_size) && (_memory_span_size > _memory_map_granularity)) ? _memory_span_size : 0;
 	assert(size >= _memory_page_size);
 #if PLATFORM_WINDOWS
+#if ENABLE_EXPLICIT_COMMIT
+	void* ptr = VirtualAlloc(0, size + padding, (_memory_huge_pages ? MEM_LARGE_PAGES : 0) | MEM_RESERVE, PAGE_READWRITE);
+#else
 	//Ok to MEM_COMMIT - according to MSDN, "actual physical pages are not allocated unless/until the virtual addresses are actually accessed"
 	void* ptr = VirtualAlloc(0, size + padding, (_memory_huge_pages ? MEM_LARGE_PAGES : 0) | MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#endif
 	if (!ptr) {
 		assert("Failed to map virtual memory block" == 0);
 		return 0;
@@ -2006,10 +2045,12 @@ rpmalloc_thread_collect(void) {
 }
 
 void
-rpmalloc_thread_statistics(rpmalloc_thread_statistics_t* stats) {
+rpmalloc_heap_statistics(heap_t * heap, rpmalloc_thread_statistics_t* stats) {
 	memset(stats, 0, sizeof(rpmalloc_thread_statistics_t));
-	heap_t* heap = get_thread_heap();
 	_acquire_heap_lock(heap);
+
+	stats->reserved = heap->spans_reserved * _memory_span_size;
+
 	void* p = atomic_load_ptr(&heap->defer_deallocate);
 	while (p) {
 		void* next = *(void**)p;
@@ -2024,7 +2065,7 @@ rpmalloc_thread_statistics(rpmalloc_thread_statistics_t* stats) {
 
 		span_t* cache = heap->size_cache[isize];
 		while (cache) {
-			stats->sizecache = cache->data.block.free_count * _memory_size_class[cache->size_class].size;
+			stats->sizecache += cache->data.block.free_count * _memory_size_class[cache->size_class].size;
 			cache = cache->next_span;
 		}
 	}
@@ -2032,10 +2073,15 @@ rpmalloc_thread_statistics(rpmalloc_thread_statistics_t* stats) {
 #if ENABLE_THREAD_CACHE
 	for (size_t iclass = 0; iclass < LARGE_CLASS_COUNT; ++iclass) {
 		if (heap->span_cache[iclass].span)
-			stats->spancache = (size_t)heap->span_cache[iclass].span->data.list.size * (iclass + 1) * _memory_span_size;
+			stats->spancache += (size_t)heap->span_cache[iclass].span->data.list.size * (iclass + 1) * _memory_span_size;
 	}
 #endif
 	_release_heap_lock(heap);
+}
+
+void
+rpmalloc_thread_statistics(rpmalloc_thread_statistics_t* stats) {
+	rpmalloc_heap_statistics(get_thread_heap(), stats);
 }
 
 void
@@ -2136,77 +2182,27 @@ rpmalloc_trim_cache(size_t since) {
 #endif
 }
 
-#pragma optimize ("", off)
 void
-rpmalloc_print_debug_info_heap(heap_t * heap) {
-    _acquire_heap_lock(heap);
-    void* p = atomic_load_ptr(&heap->defer_deallocate);
-    uint64_t deferred = 0;
-    while (p) {
-        void* next = *(void**)p;
-        span_t* span = (void*)((uintptr_t)p & _memory_span_mask);
-        deferred += _memory_size_class[span->size_class].size;
-        printf("deferred allocation of size %d (size class %d)\n", _memory_size_class[span->size_class].size, span->size_class);
-        p = next;
-    }
-    if (deferred)
-        printf("total deferred = %llu\n", deferred);
+rpmalloc_thread_statistics_total(rpmalloc_thread_statistics_t * stats) {
+    memset(stats, 0, sizeof(rpmalloc_thread_statistics_t));
 
-    uint64_t active = 0;
-    for (size_t isize = 0; isize < SIZE_CLASS_COUNT; ++isize) {
-        if (heap->active_block[isize].free_count)
-        {
-            active += heap->active_block[isize].free_count * _memory_size_class[heap->active_span[isize]->size_class].size;
-            printf("active of size %d (size class %d)\n", heap->active_block[isize].free_count * _memory_size_class[heap->active_span[isize]->size_class].size, isize);
-        }
-
-        uint64_t sizecache = 0;
-        span_t* cache = heap->size_cache[isize];
-        while (cache) {
-            printf("active of size %d (size class %d)\n", cache->data.block.free_count * _memory_size_class[cache->size_class].size, cache->size_class);
-            sizecache += cache->data.block.free_count * _memory_size_class[cache->size_class].size;
-            cache = cache->next_span;
-        }
-        if (sizecache)
-            printf("total size cached = %llu (size class %d)\n", sizecache, isize);
-    }
-    if (active)
-        printf("total active %llu\n", active);
-
-#if ENABLE_THREAD_CACHE
-    for (size_t iclass = 0; iclass < LARGE_CLASS_COUNT; ++iclass) {
-        if (heap->span_cache[iclass].span)
-            printf("active of size %d (size class %d)\n", (size_t)heap->span_cache[iclass].span->data.list.size * (iclass + 1) * _memory_span_size, iclass);
-    }
-#endif
-    _release_heap_lock(heap);
-}
-
-//! Finalize the allocator
-void
-rpmalloc_print_debug_info(void) {
-    atomic_thread_fence_acquire();
-
+    //a lock is required to gather those statistics
+#if ENABLE_GREEDY_DEALLOC
     for (size_t list_idx = 0; list_idx < HEAP_ARRAY_SIZE; ++list_idx) {
         heap_t* heap = atomic_load_ptr(&_memory_heaps[list_idx]);
         while (heap) {
-            rpmalloc_print_debug_info_heap(heap);
+
+            rpmalloc_thread_statistics_t heap_stats;
+            rpmalloc_heap_statistics(heap, &heap_stats);
+
+            stats->active += heap_stats.active;
+            stats->sizecache += heap_stats.sizecache;
+            stats->spancache += heap_stats.spancache;
+            stats->deferred += heap_stats.deferred;
+            stats->reserved += heap_stats.reserved;
+
             heap = heap->next_heap;
         }
     }
-
-#if ENABLE_GLOBAL_CACHE
-    //Free global caches
-    uint64_t globalCache = 0;
-    for (size_t iclass = 0; iclass < LARGE_CLASS_COUNT; ++iclass)
-    {
-        size_t s = (size_t)atomic_load32(&_memory_span_cache[iclass].size) * (iclass + 1) * _memory_span_size;
-        printf("global cache of size %d (size class %d) (last_use: %llu vs %llu)\n", s, _memory_size_class[iclass].size, _memory_span_cache[iclass].last_access, _last_access);
-        globalCache += s;
-    }
-
-    printf("global cache size %llu\n", globalCache);
 #endif
 }
-
-#pragma optimize ("", on)

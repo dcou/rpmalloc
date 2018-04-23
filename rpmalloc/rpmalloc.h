@@ -54,6 +54,8 @@ typedef struct rpmalloc_thread_statistics_t {
 	size_t spancache;
 	//! Current number of bytes in pending deferred deallocations
 	size_t deferred;
+	//! Current number of bytes in reserved spans not yet used
+	size_t reserved;
 	//! Total number of bytes transitioned from thread cache to global cache
 	size_t thread_to_global;
 	//! Total number of bytes transitioned from global cache to thread cache
@@ -80,6 +82,9 @@ typedef struct rpmalloc_config_t {
 	//  If you set a memory_unmap function, you must also set a memory_map function or
 	//  else the default implementation will be used for both.
 	void (*memory_unmap)(void* address, size_t size, size_t offset, size_t release);
+	//! Set to non-zero to start a background thread that will trim thread and global cache
+	//  buckets if they are inactive for the specified amount of seconds.
+	size_t auto_trim_seconds;
 	//! Size of memory pages. The page size MUST be a power of two. All memory mapping
 	//  requests to memory_map will be made with size set to a multiple of the page size.
 	size_t page_size;
@@ -132,6 +137,10 @@ rpmalloc_is_thread_initialized(void);
 extern void
 rpmalloc_thread_statistics(rpmalloc_thread_statistics_t* stats);
 
+//! Get per-thread statistics
+extern void
+rpmalloc_thread_statistics_total(rpmalloc_thread_statistics_t* stats);
+
 //! Get global statistics
 extern void
 rpmalloc_global_statistics(rpmalloc_global_statistics_t* stats);
@@ -171,6 +180,10 @@ rpposix_memalign(void **memptr, size_t alignment, size_t size);
 //! Query the usable size of the given memory block (from given pointer to the end of block)
 extern size_t
 rpmalloc_usable_size(void* ptr);
+
+//! Trim cache buckets that have not been used since the last Nth call to this function.
+extern void
+rpmalloc_trim_cache(size_t since);
 
 #ifdef __cplusplus
 }
