@@ -205,6 +205,8 @@ static FORCEINLINE void _release_lock(atomic32_t * lock) { while (!atomic_cas_va
 #define LARGE_SIZE_LIMIT          ((LARGE_CLASS_COUNT * _memory_span_size) - SPAN_HEADER_SIZE)
 //! Size of a span header
 #define SPAN_HEADER_SIZE          64
+//! Number of bytes to leave unused at the end of each span.
+#define SPAN_FOOTER_SIZE          8
 
 #define pointer_offset(ptr, ofs) (void*)((char*)(ptr) + (ptrdiff_t)(ofs))
 #define pointer_diff(first, second) (ptrdiff_t)((const char*)(first) - (const char*)(second))
@@ -1021,7 +1023,7 @@ _memory_allocate_large_from_heap_core(heap_t* heap, size_t size) {
 	//Calculate number of needed max sized spans (including header)
 	//Since this function is never called if size > LARGE_SIZE_LIMIT
 	//the span_count is guaranteed to be <= LARGE_CLASS_COUNT
-	size += SPAN_HEADER_SIZE;
+	size += SPAN_HEADER_SIZE + SPAN_FOOTER_SIZE;
 	size_t span_count = size >> _memory_span_size_shift;
 	if (size & (_memory_span_size - 1))
 		++span_count;
@@ -1261,7 +1263,7 @@ _memory_allocate(size_t size) {
 		return _memory_allocate_large_from_heap(get_thread_heap(), size);
 
 	//Oversized, allocate pages directly
-	size += SPAN_HEADER_SIZE;
+	size += SPAN_HEADER_SIZE + SPAN_FOOTER_SIZE;
 	size_t num_pages = size >> _memory_page_size_shift;
 	if (size & (_memory_page_size - 1))
 		++num_pages;
@@ -1398,7 +1400,7 @@ _memory_usable_size(void* p) {
 static void
 _memory_adjust_size_class(size_t iclass) {
 	size_t block_size = _memory_size_class[iclass].size;
-	size_t block_count = (_memory_span_size - SPAN_HEADER_SIZE) / block_size;
+	size_t block_count = (_memory_span_size - (SPAN_HEADER_SIZE + SPAN_FOOTER_SIZE)) / block_size;
 
 	_memory_size_class[iclass].block_count = (uint16_t)block_count;
 	_memory_size_class[iclass].class_idx = (uint16_t)iclass;
