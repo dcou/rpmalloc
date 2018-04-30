@@ -72,12 +72,18 @@
 //! Default number of spans to map in call to map more virtual memory
 #define DEFAULT_SPAN_MAP_COUNT    32
 #endif
+#ifndef THREAD_CACHE_MULTIPLIER
 //! Multiplier for thread cache (cache limit will be span release count multiplied by this value)
 #define THREAD_CACHE_MULTIPLIER 16
+#endif
+#ifndef GLOBAL_CACHE_MULTIPLIER
 //! Multiplier for global cache (cache limit will be span release count multiplied by this value)
 #define GLOBAL_CACHE_MULTIPLIER 32
+#endif
+#ifndef MAX_DEFERRED_DEALLOC_SIZE
 //! The limit of deferred dealloc size before forcing dealloc directly from the freeing thread
 #define MAX_DEFERRED_DEALLOC_SIZE (1024*1024)
+#endif
 
 #if !ENABLE_THREAD_CACHE
 #  undef ENABLE_GLOBAL_CACHE
