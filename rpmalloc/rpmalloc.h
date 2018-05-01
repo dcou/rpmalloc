@@ -37,6 +37,8 @@ extern "C" {
 typedef struct rpmalloc_global_statistics_t {
 	//! Current amount of virtual memory mapped (only if ENABLE_STATISTICS=1)
 	size_t mapped;
+	//! Current amount of virtual memory committed (only if ENABLE_STATISTICS=1)
+	size_t commit;
 	//! Current amount of memory in global caches for small and medium sizes (<64KiB)
 	size_t cached;
 	//! Total amount of memory mapped (only if ENABLE_STATISTICS=1)

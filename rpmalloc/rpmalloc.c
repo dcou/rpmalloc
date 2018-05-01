@@ -436,6 +436,8 @@ static atomic32_t _memory_active_heaps;
 #if ENABLE_STATISTICS
 //! Total number of currently mapped memory pages
 static atomic32_t _mapped_pages;
+//! Total number of currently committed memory pages
+static atomic32_t _commit_pages;
 //! Total number of currently lost spans
 static atomic32_t _reserved_spans;
 //! Running counter of total number of mapped memory pages since start
@@ -547,6 +549,7 @@ _memory_map(size_t size, size_t* offset) {
 	assert(!(size % _memory_page_size));
 	assert(size >= _memory_page_size);
 	_memory_statistics_add(&_mapped_pages, (size >> _memory_page_size_shift));
+	_memory_statistics_add(&_commit_pages, (size >> _memory_page_size_shift));
 	_memory_statistics_add(&_mapped_total, (size >> _memory_page_size_shift));
 	return _memory_config.memory_map(size, offset);
 }
@@ -556,6 +559,10 @@ static void
 _memory_unmap(void* address, size_t size, size_t offset, size_t release) {
 	assert(!release || (release >= size));
 	assert(!release || (release >= _memory_page_size));
+	if (size) {
+		assert(!(size % _memory_page_size));
+		_memory_statistics_sub(&_commit_pages, (size >> _memory_page_size_shift));
+	}
 	if (release) {
 		assert(!(release % _memory_page_size));
 		_memory_statistics_sub(&_mapped_pages, (release >> _memory_page_size_shift));
@@ -1686,6 +1693,7 @@ rpmalloc_initialize_config(const rpmalloc_config_t* config) {
 #if ENABLE_STATISTICS
 	atomic_store32(&_reserved_spans, 0);
 	atomic_store32(&_mapped_pages, 0);
+	atomic_store32(&_commit_pages, 0);
 	atomic_store32(&_mapped_total, 0);
 	atomic_store32(&_unmapped_total, 0);
 #endif
@@ -1769,6 +1777,7 @@ rpmalloc_finalize(void) {
 #if ENABLE_STATISTICS
 	//If you hit these asserts you probably have memory leaks or double frees in your code
 	assert(!atomic_load32(&_mapped_pages));
+	assert(!atomic_load32(&_commit_pages));
 	assert(!atomic_load32(&_reserved_spans));
 #endif
 
@@ -2108,6 +2117,7 @@ rpmalloc_global_statistics(rpmalloc_global_statistics_t* stats) {
 	memset(stats, 0, sizeof(rpmalloc_global_statistics_t));
 #if ENABLE_STATISTICS
 	stats->mapped = (size_t)atomic_load32(&_mapped_pages) * _memory_page_size;
+	stats->commit = (size_t)atomic_load32(&_commit_pages) * _memory_page_size;
 	stats->mapped_total = (size_t)atomic_load32(&_mapped_total) * _memory_page_size;
 	stats->unmapped_total = (size_t)atomic_load32(&_unmapped_total) * _memory_page_size;
 #endif
