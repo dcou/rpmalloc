@@ -482,6 +482,17 @@ set_thread_heap(heap_t* heap) {
 #endif
 }
 
+//! Get the current thread heap and initialize on-demand
+static FORCEINLINE heap_t*
+get_thread_heap_safe(void) {
+    heap_t * heap = get_thread_heap();
+    if (heap)
+        return heap;
+
+    rpmalloc_thread_initialize();
+    return get_thread_heap();
+}
+
 static FORCEINLINE void
 _acquire_heap_lock(heap_t * heap)
 {
@@ -1282,9 +1293,9 @@ _memory_deallocate_defer(int32_t heap_id, void* p) {
 static void*
 _memory_allocate(size_t size) {
 	if (size <= _memory_medium_size_limit)
-		return _memory_allocate_from_heap(get_thread_heap(), size);
+		return _memory_allocate_from_heap(get_thread_heap_safe(), size);
 	else if (size <= LARGE_SIZE_LIMIT)
-		return _memory_allocate_large_from_heap(get_thread_heap(), size);
+		return _memory_allocate_large_from_heap(get_thread_heap_safe(), size);
 
 	//Oversized, allocate pages directly
 	size += SPAN_HEADER_SIZE + SPAN_FOOTER_SIZE;
@@ -1311,17 +1322,17 @@ _memory_deallocate(void* p) {
 	span_t* span = (span_t*)((uintptr_t)p & _memory_span_mask);
 	int32_t heap_id = atomic_load32(&span->heap_id);
 	if (heap_id) {
-		heap_t* heap = get_thread_heap();
 		if (span->size_class < SIZE_CLASS_COUNT) {
+			heap_t* heap = get_thread_heap();
 			//Check if block belongs to this heap or if deallocation should be deferred
-			if (heap->id == heap_id)
+			if (heap && heap->id == heap_id)
 				_memory_deallocate_to_heap(heap, span, p);
 			else
 				_memory_deallocate_defer(heap_id, p);
 		}
 		else {
 			//Large blocks can always be deallocated and transferred between heaps
-			_memory_deallocate_large_to_heap(heap, span);
+			_memory_deallocate_large_to_heap(get_thread_heap_safe(), span);
 		}
 	}
 	else {
