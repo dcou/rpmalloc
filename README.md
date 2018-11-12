@@ -17,6 +17,21 @@ Please consider our Patreon to support our work - https://www.patreon.com/rampan
 
 Created by Mattias Jansson ([@maniccoder](https://twitter.com/maniccoder)) / Rampant Pixels - http://www.rampantpixels.com
 
+# Greedy unmap fork enhancements
+
+* Better memory usage by returning memory to the system from freeing thread when the owner thread of the heap is inactive.
+* No need to call __rpmalloc_thread_initialize__ in this version as it will be called on-demand when a new thread is encountered.
+
+When configured with
+
+#define ENABLE_GREEDY_UNMAP 1
+
+#define ENABLE_THREAD_CACHE 0
+
+The behaviour is now similar to Windows HeapAlloc/HeapFree in memory usage but with much better performance.
+
+![Performance & Memory Usage Comparison](https://user-images.githubusercontent.com/29634143/38499710-71b48f08-3bd6-11e8-82e4-82ca36d1ba1f.png)
+
 # Performance
 We believe rpmalloc is faster than most popular memory allocators like tcmalloc, hoard, ptmalloc3 and others without causing extra allocated memory overhead in the thread caches compared to these allocators. We also believe the implementation to be easier to read and modify compared to these allocators, as it is a single source file of ~2000 lines of C code. All allocations have a natural 32-byte alignment.
 
