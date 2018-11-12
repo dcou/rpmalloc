@@ -1,5 +1,7 @@
-# rpmalloc - Rampant Pixels Memory Allocator
-This library provides a public domain cross platform lock free thread caching 32-byte aligned memory allocator implemented in C. The latest source code is always available at https://github.com/rampantpixels/rpmalloc
+# rpmalloc-greedy - Rampant Pixels Memory Allocator with a twist
+This library provides a public domain cross platform lock free thread caching 32-byte aligned memory allocator implemented in C. The latest source code is always available at https://github.com/dcou/rpmalloc-greedy
+
+This version is based on the awesome work of Mattias Jansson from https://github.com/rampantpixels/rpmalloc
 
 Platforms currently supported:
 
